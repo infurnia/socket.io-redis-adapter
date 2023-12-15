@@ -78,19 +78,19 @@ export interface RedisAdapterOptions {
 /**
  * Returns a function that will create a RedisAdapter instance.
  *
- * @param pubClient - a Redis client that will be used to publish messages
- * @param subClient - a Redis client that will be used to receive messages (put in subscribed state)
+ * @param localPubClient - a Redis client that will be used to publish messages
+ * @param allSubClients - a Redis client that will be used to receive messages (put in subscribed state)
  * @param opts - additional options
  *
  * @public
  */
 export function createAdapter(
-  pubClient: any,
-  subClient: any,
+  localPubClient: any,
+  allSubClients: Array<any>,
   opts?: Partial<RedisAdapterOptions>
 ) {
   return function (nsp) {
-    return new RedisAdapter(nsp, pubClient, subClient, opts);
+    return new RedisAdapter(nsp, localPubClient, allSubClients, opts);
   };
 }
 
@@ -113,16 +113,16 @@ export class RedisAdapter extends Adapter {
    * Adapter constructor.
    *
    * @param nsp - the namespace
-   * @param pubClient - a Redis client that will be used to publish messages
-   * @param subClient - a Redis client that will be used to receive messages (put in subscribed state)
+   * @param localPubClient - a Redis client that will be used to publish messages
+   * @param allSubClients - a Redis client that will be used to receive messages (put in subscribed state)
    * @param opts - additional options
    *
    * @public
    */
   constructor(
     nsp: any,
-    readonly pubClient: any,
-    readonly subClient: any,
+    readonly localPubClient: any,
+    readonly allSubClients: Array<any>,
     opts: Partial<RedisAdapterOptions> = {}
   ) {
     super(nsp);
@@ -140,58 +140,29 @@ export class RedisAdapter extends Adapter {
     this.responseChannel = prefix + "-response#" + this.nsp.name + "#";
     this.specificResponseChannel = this.responseChannel + this.uid + "#";
 
-    const isRedisV4 = typeof this.pubClient.pSubscribe === "function";
-    if (isRedisV4) {
-      this.redisListeners.set("psub", (msg, channel) => {
-        this.onmessage(null, channel, msg);
-      });
-
-      this.redisListeners.set("sub", (msg, channel) => {
-        this.onrequest(channel, msg);
-      });
-
-      this.subClient.pSubscribe(
-        this.channel + "*",
-        this.redisListeners.get("psub"),
-        true
-      );
-      this.subClient.subscribe(
-        [
-          this.requestChannel,
-          this.responseChannel,
-          this.specificResponseChannel,
-        ],
-        this.redisListeners.get("sub"),
-        true
-      );
-    } else {
-      this.redisListeners.set("pmessageBuffer", this.onmessage.bind(this));
-      this.redisListeners.set("messageBuffer", this.onrequest.bind(this));
-
-      this.subClient.psubscribe(this.channel + "*");
-      this.subClient.on(
-        "pmessageBuffer",
-        this.redisListeners.get("pmessageBuffer")
-      );
-
-      this.subClient.subscribe([
-        this.requestChannel,
-        this.responseChannel,
-        this.specificResponseChannel,
-      ]);
-      this.subClient.on(
-        "messageBuffer",
-        this.redisListeners.get("messageBuffer")
-      );
-    }
+    this.redisListeners.set("pmessageBuffer", this.onmessage.bind(this));
+    this.redisListeners.set("messageBuffer", this.onrequest.bind(this));
 
     this.friendlyErrorHandler = function () {
       if (this.listenerCount("error") === 1) {
         console.warn("missing 'error' handler on this Redis client");
       }
     };
-    this.pubClient.on("error", this.friendlyErrorHandler);
-    this.subClient.on("error", this.friendlyErrorHandler);
+
+    for (let subClient of this.allSubClients) {
+      subClient.psubscribe(this.channel + "*");
+      subClient.on("pmessageBuffer", this.redisListeners.get("pmessageBuffer"));
+
+      subClient.subscribe([
+        this.requestChannel,
+        this.responseChannel,
+        this.specificResponseChannel,
+      ]);
+      subClient.on("messageBuffer", this.redisListeners.get("messageBuffer"));
+      subClient.on("error", this.friendlyErrorHandler);
+    }
+
+    this.localPubClient.on("error", this.friendlyErrorHandler);
   }
 
   /**
@@ -412,7 +383,7 @@ export class RedisAdapter extends Adapter {
           }
           called = true;
           debug("calling acknowledgement with %j", arg);
-          this.pubClient.publish(
+          this.localPubClient.publish(
             this.responseChannel,
             JSON.stringify({
               type: RequestType.SERVER_SIDE_EMIT,
@@ -482,7 +453,7 @@ export class RedisAdapter extends Adapter {
       ? `${this.responseChannel}${request.uid}#`
       : this.responseChannel;
     debug("publishing response to channel %s", responseChannel);
-    this.pubClient.publish(responseChannel, response);
+    this.localPubClient.publish(responseChannel, response);
   }
 
   /**
@@ -633,7 +604,7 @@ export class RedisAdapter extends Adapter {
         channel += opts.rooms.keys().next().value + "#";
       }
       debug("publishing message to channel %s", channel);
-      this.pubClient.publish(channel, msg);
+      this.localPubClient.publish(channel, msg);
     }
     super.broadcast(packet, opts);
   }
@@ -665,7 +636,7 @@ export class RedisAdapter extends Adapter {
         opts: rawOpts,
       });
 
-      this.pubClient.publish(this.requestChannel, request);
+      this.localPubClient.publish(this.requestChannel, request);
 
       this.ackRequests.set(requestId, {
         clientCountCallback,
@@ -722,7 +693,7 @@ export class RedisAdapter extends Adapter {
         rooms: localRooms,
       });
 
-      this.pubClient.publish(this.requestChannel, request);
+      this.localPubClient.publish(this.requestChannel, request);
     });
   }
 
@@ -771,7 +742,7 @@ export class RedisAdapter extends Adapter {
         sockets: localSockets,
       });
 
-      this.pubClient.publish(this.requestChannel, request);
+      this.localPubClient.publish(this.requestChannel, request);
     });
   }
 
@@ -790,7 +761,7 @@ export class RedisAdapter extends Adapter {
       rooms: [...rooms],
     });
 
-    this.pubClient.publish(this.requestChannel, request);
+    this.localPubClient.publish(this.requestChannel, request);
   }
 
   public delSockets(opts: BroadcastOptions, rooms: Room[]) {
@@ -808,7 +779,7 @@ export class RedisAdapter extends Adapter {
       rooms: [...rooms],
     });
 
-    this.pubClient.publish(this.requestChannel, request);
+    this.localPubClient.publish(this.requestChannel, request);
   }
 
   public disconnectSockets(opts: BroadcastOptions, close: boolean) {
@@ -826,7 +797,7 @@ export class RedisAdapter extends Adapter {
       close,
     });
 
-    this.pubClient.publish(this.requestChannel, request);
+    this.localPubClient.publish(this.requestChannel, request);
   }
 
   public serverSideEmit(packet: any[]): void {
@@ -845,7 +816,7 @@ export class RedisAdapter extends Adapter {
       data: packet,
     });
 
-    this.pubClient.publish(this.requestChannel, request);
+    this.localPubClient.publish(this.requestChannel, request);
   }
 
   private async serverSideEmitWithAck(packet: any[]) {
@@ -887,59 +858,30 @@ export class RedisAdapter extends Adapter {
       responses: [],
     });
 
-    this.pubClient.publish(this.requestChannel, request);
+    this.localPubClient.publish(this.requestChannel, request);
   }
 
   override serverCount(): Promise<number> {
-    return PUBSUB(this.pubClient, "NUMSUB", this.requestChannel);
+    return PUBSUB(this.localPubClient, "NUMSUB", this.requestChannel);
   }
 
   close(): Promise<void> | void {
-    const isRedisV4 = typeof this.pubClient.pSubscribe === "function";
-    if (isRedisV4) {
-      this.subClient.pUnsubscribe(
-        this.channel + "*",
-        this.redisListeners.get("psub"),
-        true
-      );
-
-      // There is a bug in redis v4 when unsubscribing multiple channels at once, so we'll unsub one at a time.
-      // See https://github.com/redis/node-redis/issues/2052
-      this.subClient.unsubscribe(
-        this.requestChannel,
-        this.redisListeners.get("sub"),
-        true
-      );
-      this.subClient.unsubscribe(
-        this.responseChannel,
-        this.redisListeners.get("sub"),
-        true
-      );
-      this.subClient.unsubscribe(
-        this.specificResponseChannel,
-        this.redisListeners.get("sub"),
-        true
-      );
-    } else {
-      this.subClient.punsubscribe(this.channel + "*");
-      this.subClient.off(
+    for (let subClient of this.allSubClients) {
+      subClient.punsubscribe(this.channel + "*");
+      subClient.off(
         "pmessageBuffer",
         this.redisListeners.get("pmessageBuffer")
       );
 
-      this.subClient.unsubscribe([
+      subClient.unsubscribe([
         this.requestChannel,
         this.responseChannel,
         this.specificResponseChannel,
       ]);
-      this.subClient.off(
-        "messageBuffer",
-        this.redisListeners.get("messageBuffer")
-      );
+      subClient.off("messageBuffer", this.redisListeners.get("messageBuffer"));
+      subClient.off("error", this.friendlyErrorHandler);
     }
-
-    this.pubClient.off("error", this.friendlyErrorHandler);
-    this.subClient.off("error", this.friendlyErrorHandler);
+    this.localPubClient.off("error", this.friendlyErrorHandler);
   }
 }
 
